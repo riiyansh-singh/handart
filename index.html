@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HandArt — Gesture Drawing</title>
+<meta name="description" content="Draw in thin air using your hand. Powered by MediaPipe Hands.">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+<!-- MediaPipe -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"           crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<style>
+/* ════════════════════════════════════════════════════════════════
+   DESIGN TOKENS
+════════════════════════════════════════════════════════════════ */
+:root {
+  --bg        : #020c14;
+  --surface   : rgba(2, 18, 30, 0.72);
+  --border    : rgba(0, 200, 255, 0.14);
+  --cyan      : #00e5ff;
+  --cyan-dim  : #006688;
+  --amber     : #ff9500;
+  --volt      : #ccff00;
+  --red       : #ff3344;
+  --white     : #d8eeff;
+  --font-hud  : 'Rajdhani', sans-serif;
+  --font-mono : 'Share Tech Mono', monospace;
+  --ease      : cubic-bezier(0.16, 1, 0.3, 1);
+  --t         : 0.3s;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   RESET
+════════════════════════════════════════════════════════════════ */
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+
+html, body {
+  width:100%; height:100%;
+  overflow:hidden;
+  background:var(--bg);
+  font-family:var(--font-mono);
+  user-select:none;
+  -webkit-user-select:none;
+  cursor:crosshair;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   CANVAS STACK  (all fixed, stacked by z-index)
+════════════════════════════════════════════════════════════════ */
+#video {
+  position:fixed; inset:0;
+  width:100%; height:100%;
+  object-fit:cover;
+  transform:scaleX(-1);   /* mirror for natural selfie feel */
+  opacity:0.28;
+  z-index:0;
+  transition:opacity var(--t) var(--ease);
+}
+
+canvas {
+  position:fixed; inset:0;
+  width:100%; height:100%;
+  pointer-events:none;
+}
+
+#persistCanvas  { z-index:1; }
+#activeCanvas   { z-index:2; }
+#particleCanvas { z-index:3; }
+#handCanvas     { z-index:4; }
+
+/* ════════════════════════════════════════════════════════════════
+   AMBIENT VIGNETTE
+════════════════════════════════════════════════════════════════ */
+#vignette {
+  position:fixed; inset:0; z-index:5; pointer-events:none;
+  background:radial-gradient(ellipse 80% 80% at 50% 50%,
+    transparent 40%, rgba(2,12,20,0.75) 100%);
+}
+
+/* ════════════════════════════════════════════════════════════════
+   SCANLINES
+════════════════════════════════════════════════════════════════ */
+#scanlines {
+  position:fixed; inset:0; z-index:6; pointer-events:none;
+  background:repeating-linear-gradient(
+    0deg,
+    transparent, transparent 2px,
+    rgba(0,200,255,0.012) 2px, rgba(0,200,255,0.012) 4px
+  );
+  animation:scanScroll 10s linear infinite;
+}
+@keyframes scanScroll {
+  to { background-position:0 200px; }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   HUD LAYER
+════════════════════════════════════════════════════════════════ */
+#hud {
+  position:fixed; inset:0; z-index:10; pointer-events:none;
+}
+
+/* ─ shared glass panel ─ */
+.glass {
+  background:var(--surface);
+  border:1px solid var(--border);
+  backdrop-filter:blur(16px);
+  -webkit-backdrop-filter:blur(16px);
+  border-radius:12px;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   TOP-LEFT  ─  MODE BADGE
+════════════════════════════════════════════════════════════════ */
+#mode-badge {
+  position:absolute;
+  top:20px; left:20px;
+  display:flex; align-items:center; gap:10px;
+  padding:9px 18px 9px 13px;
+  border-radius:50px;
+  min-width:170px;
+  transition:border-color var(--t) var(--ease);
+}
+
+#mode-dot {
+  width:8px; height:8px; border-radius:50%;
+  background:var(--cyan);
+  box-shadow:0 0 8px var(--cyan);
+  flex-shrink:0;
+  transition:background var(--t), box-shadow var(--t);
+  animation:dotPulse 2s ease-in-out infinite;
+}
+@keyframes dotPulse {
+  0%,100%{ opacity:1; }
+  50%    { opacity:0.25; }
+}
+
+#mode-text {
+  font-family:var(--font-hud);
+  font-size:0.88rem; font-weight:600;
+  letter-spacing:0.12em; text-transform:uppercase;
+  color:var(--cyan);
+  text-shadow:0 0 10px var(--cyan);
+  transition:color var(--t), text-shadow var(--t);
+  min-width:110px;
+}
+
+/* gesture-specific colours */
+#mode-badge[data-gesture="DRAWING"] #mode-dot  { animation:none; background:#00e5ff; box-shadow:0 0 14px #00e5ff; }
+#mode-badge[data-gesture="PINCH"]   #mode-dot  { animation:none; background:var(--amber); box-shadow:0 0 14px var(--amber); }
+#mode-badge[data-gesture="PINCH"]   #mode-text { color:var(--amber); text-shadow:0 0 10px var(--amber); }
+#mode-badge[data-gesture="FIST"]    #mode-dot  { animation:none; background:var(--red);   box-shadow:0 0 14px var(--red); }
+#mode-badge[data-gesture="FIST"]    #mode-text { color:var(--red);   text-shadow:0 0 10px var(--red); }
+#mode-badge[data-gesture="PEACE"]   #mode-dot  { animation:none; background:var(--volt);  box-shadow:0 0 14px var(--volt); }
+#mode-badge[data-gesture="PEACE"]   #mode-text { color:var(--volt);  text-shadow:0 0 10px var(--volt); }
+#mode-badge[data-gesture="OPEN"]    #mode-dot  { background:rgba(255,255,255,0.3); box-shadow:none; }
+#mode-badge[data-gesture="OPEN"]    #mode-text { color:rgba(255,255,255,0.45); text-shadow:none; }
+
+/* ════════════════════════════════════════════════════════════════
+   TOP-RIGHT  ─  COLOR PANEL
+════════════════════════════════════════════════════════════════ */
+#color-panel {
+  position:absolute;
+  top:20px; right:20px;
+  display:flex; flex-direction:column; align-items:flex-end; gap:8px;
+}
+
+/* active colour chip */
+#color-chip {
+  display:flex; align-items:center; gap:10px;
+  padding:9px 14px;
+  border-radius:50px;
+}
+
+#color-swatch {
+  width:16px; height:16px; border-radius:50%;
+  transition:background var(--t), box-shadow var(--t);
+  flex-shrink:0;
+}
+#color-name {
+  font-family:var(--font-hud);
+  font-size:0.78rem; font-weight:600;
+  letter-spacing:0.2em; text-transform:uppercase;
+  min-width:82px; text-align:right;
+  transition:color var(--t);
+}
+
+/* palette row */
+#swatch-row {
+  display:flex; gap:6px;
+  padding:6px 10px;
+  border-radius:50px;
+  pointer-events:all;
+}
+
+.swatch {
+  width:14px; height:14px; border-radius:50%;
+  cursor:pointer;
+  transition:transform 0.2s var(--ease), box-shadow 0.2s ease;
+  border:1px solid rgba(255,255,255,0.08);
+}
+.swatch:hover { transform:scale(1.4); }
+.swatch.active {
+  transform:scale(1.5);
+  border-color:rgba(255,255,255,0.6);
+  box-shadow:0 0 10px currentColor;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   TOP-CENTER  ─  FIST / CLEAR BAR
+════════════════════════════════════════════════════════════════ */
+#fist-bar-wrap {
+  position:absolute;
+  top:18px; left:50%; transform:translateX(-50%);
+  width:220px;
+  opacity:0; pointer-events:none;
+  transition:opacity 0.2s ease;
+}
+#fist-bar-wrap.visible { opacity:1; }
+
+.fist-label-row {
+  display:flex; justify-content:space-between;
+  margin-bottom:5px;
+}
+.fist-label {
+  font-size:0.55rem; letter-spacing:0.3em; text-transform:uppercase;
+  color:rgba(255,60,60,0.7);
+}
+#fist-pct {
+  font-size:0.55rem; letter-spacing:0.1em;
+  color:rgba(255,60,60,0.5);
+}
+
+.fist-track {
+  height:2px;
+  background:rgba(255,50,50,0.12);
+  border-radius:1px; overflow:hidden;
+}
+#fist-bar {
+  height:100%; width:0%;
+  background:linear-gradient(90deg, #ff2222, #ff6644);
+  box-shadow:0 0 8px #ff3333;
+  transition:width 0.08s linear;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   BOTTOM-LEFT  ─  CONFIDENCE METER
+════════════════════════════════════════════════════════════════ */
+#conf-panel {
+  position:absolute;
+  bottom:24px; left:24px;
+  display:flex; align-items:center; gap:10px;
+  padding:8px 14px;
+}
+
+.conf-label {
+  font-size:0.52rem; letter-spacing:0.28em; text-transform:uppercase;
+  color:rgba(0,200,255,0.35);
+}
+#conf-bars {
+  display:flex; gap:3px; align-items:flex-end;
+}
+.cbar {
+  width:3px; border-radius:1px;
+  background:rgba(0,200,255,0.12);
+  transition:background 0.2s ease, box-shadow 0.2s ease;
+}
+.cbar.active { background:var(--cyan); box-shadow:0 0 6px var(--cyan); }
+.cbar:nth-child(1){ height:6px;  }
+.cbar:nth-child(2){ height:9px;  }
+.cbar:nth-child(3){ height:12px; }
+.cbar:nth-child(4){ height:15px; }
+.cbar:nth-child(5){ height:18px; }
+
+/* ════════════════════════════════════════════════════════════════
+   BOTTOM-RIGHT  ─  STROKE COUNTER
+════════════════════════════════════════════════════════════════ */
+#stroke-panel {
+  position:absolute;
+  bottom:24px; right:24px;
+  text-align:right;
+  padding:8px 14px;
+}
+#stroke-count {
+  font-family:var(--font-hud);
+  font-size:1.6rem; font-weight:700;
+  color:rgba(255,255,255,0.65); line-height:1;
+}
+.stroke-lbl {
+  font-size:0.48rem; letter-spacing:0.32em; text-transform:uppercase;
+  color:rgba(255,255,255,0.2); margin-top:2px;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   BOTTOM-CENTER  ─  GESTURE HELP STRIP
+════════════════════════════════════════════════════════════════ */
+#help {
+  position:absolute;
+  bottom:24px; left:50%; transform:translateX(-50%);
+  display:flex; gap:24px;
+  padding:12px 24px;
+  border-radius:50px;
+  white-space:nowrap;
+  transition:opacity 1.2s ease;
+}
+#help.faded { opacity:0; pointer-events:none; }
+
+.h-item { display:flex; align-items:center; gap:8px; }
+.h-icon { font-size:1.05rem; line-height:1; }
+.h-desc {
+  font-size:0.56rem; letter-spacing:0.14em; text-transform:uppercase;
+  color:rgba(255,255,255,0.4); line-height:1.6;
+}
+.h-desc strong { color:rgba(255,255,255,0.65); display:block; }
+
+/* ════════════════════════════════════════════════════════════════
+   NO-HAND INDICATOR  ─  centre screen
+════════════════════════════════════════════════════════════════ */
+#no-hand {
+  position:absolute; top:50%; left:50%;
+  transform:translate(-50%,-50%);
+  text-align:center;
+  opacity:0; pointer-events:none;
+  transition:opacity 0.6s ease;
+}
+#no-hand.visible { opacity:0.5; }
+
+.nh-icon {
+  font-size:3.5rem; line-height:1;
+  margin-bottom:10px;
+  animation:floatY 3s ease-in-out infinite;
+}
+@keyframes floatY {
+  0%,100% { transform:translateY(0); }
+  50%     { transform:translateY(-10px); }
+}
+.nh-label {
+  font-size:0.58rem; letter-spacing:0.4em; text-transform:uppercase;
+  color:rgba(255,255,255,0.3);
+}
+
+/* ════════════════════════════════════════════════════════════════
+   CORNER HUD BRACKETS
+════════════════════════════════════════════════════════════════ */
+.chud {
+  position:fixed; width:44px; height:44px;
+  border-color:rgba(0,210,255,0.2); border-style:solid;
+  z-index:8; pointer-events:none;
+  transition:border-color 0.5s ease;
+  animation:cornerGlow 4s ease-in-out infinite alternate;
+}
+@keyframes cornerGlow {
+  0%  { border-color:rgba(0,210,255,0.12); }
+  100%{ border-color:rgba(0,210,255,0.35); }
+}
+.chud.tl{ top:12px; left:12px;  border-width:1px 0 0 1px; }
+.chud.tr{ top:12px; right:12px; border-width:1px 1px 0 0; }
+.chud.bl{ bottom:12px; left:12px;  border-width:0 0 1px 1px; }
+.chud.br{ bottom:12px; right:12px; border-width:0 1px 1px 0; }
+
+/* ════════════════════════════════════════════════════════════════
+   CLEAR FLASH
+════════════════════════════════════════════════════════════════ */
+#clear-flash {
+  position:fixed; inset:0; z-index:50; pointer-events:none;
+  background:rgba(255,30,30,0.09);
+  opacity:0; transition:opacity 0.12s ease;
+}
+#clear-flash.active { opacity:1; }
+
+/* ════════════════════════════════════════════════════════════════
+   SAVE TOAST
+════════════════════════════════════════════════════════════════ */
+#save-toast {
+  position:fixed; top:50%; left:50%;
+  transform:translate(-50%,-50%) scale(0.88);
+  z-index:60; pointer-events:none;
+  padding:14px 36px;
+  background:rgba(0,229,255,0.08);
+  border:1px solid rgba(0,229,255,0.5);
+  border-radius:14px;
+  font-family:var(--font-hud);
+  font-size:0.95rem; font-weight:600;
+  letter-spacing:0.22em; text-transform:uppercase;
+  color:var(--cyan); text-shadow:0 0 12px var(--cyan);
+  backdrop-filter:blur(24px);
+  opacity:0;
+  transition:opacity 0.3s ease, transform 0.35s var(--ease);
+}
+#save-toast.visible {
+  opacity:1;
+  transform:translate(-50%,-50%) scale(1);
+}
+
+/* ════════════════════════════════════════════════════════════════
+   KEYBOARD HINT  (top-right, below colour panel)
+════════════════════════════════════════════════════════════════ */
+#kbd-hint {
+  position:fixed;
+  top:90px; right:24px;
+  font-size:0.48rem; letter-spacing:0.2em; text-transform:uppercase;
+  color:rgba(255,255,255,0.16);
+  line-height:2.2; z-index:10; pointer-events:none;
+}
+kbd {
+  background:rgba(255,255,255,0.07);
+  border:1px solid rgba(255,255,255,0.14);
+  border-radius:3px; padding:1px 6px;
+  font-family:var(--font-mono); font-size:0.48rem;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   LOADING SCREEN
+════════════════════════════════════════════════════════════════ */
+#loading {
+  position:fixed; inset:0; z-index:200;
+  background:var(--bg);
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:28px;
+  transition:opacity 0.8s ease;
+}
+#loading.hidden { opacity:0; pointer-events:none; }
+
+.ld-logo {
+  font-family:var(--font-hud);
+  font-size:3.4rem; font-weight:700; letter-spacing:0.25em;
+  color:var(--cyan);
+  text-shadow:0 0 20px var(--cyan), 0 0 70px #0055ff;
+  animation:logoBreath 2.4s ease-in-out infinite alternate;
+}
+@keyframes logoBreath {
+  0%  { text-shadow:0 0 12px var(--cyan), 0 0 40px #0055ff; }
+  100%{ text-shadow:0 0 28px var(--cyan), 0 0 100px #0088ff, 0 0 180px #0033ff; }
+}
+
+.ld-tagline {
+  font-size:0.62rem; letter-spacing:0.4em; text-transform:uppercase;
+  color:rgba(0,220,255,0.4); margin-top:-18px;
+}
+
+.ld-bar-wrap {
+  width:260px; height:1px;
+  background:rgba(0,229,255,0.12);
+  border-radius:1px; overflow:hidden;
+}
+#loading-bar {
+  height:100%; width:0%;
+  background:var(--cyan); box-shadow:0 0 10px var(--cyan);
+  transition:width 0.5s var(--ease);
+}
+
+#loading-label {
+  font-size:0.6rem; letter-spacing:0.3em; text-transform:uppercase;
+  color:rgba(0,200,255,0.45);
+  min-height:1.2em;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   DRAWING COLOR INDICATOR LINE  (left edge accent)
+════════════════════════════════════════════════════════════════ */
+#color-accent {
+  position:fixed;
+  left:0; top:10%; bottom:10%;
+  width:2px; z-index:9; pointer-events:none;
+  border-radius:0 1px 1px 0;
+  background:var(--cyan);
+  box-shadow:0 0 12px var(--cyan), 0 0 30px var(--cyan);
+  transition:background var(--t), box-shadow var(--t);
+  opacity:0.6;
+}
+</style>
+</head>
+<body>
+
+<!-- Camera feed -->
+<video id="video" autoplay playsinline muted></video>
+
+<!-- Drawing layers -->
+<canvas id="persistCanvas"></canvas>
+<canvas id="activeCanvas"></canvas>
+<canvas id="particleCanvas"></canvas>
+<canvas id="handCanvas"></canvas>
+
+<!-- Atmosphere -->
+<div id="vignette"></div>
+<div id="scanlines"></div>
+
+<!-- Color accent bar -->
+<div id="color-accent"></div>
+
+<!-- Corner brackets -->
+<div class="chud tl"></div>
+<div class="chud tr"></div>
+<div class="chud bl"></div>
+<div class="chud br"></div>
+
+<!-- Clear flash -->
+<div id="clear-flash"></div>
+
+<!-- Save toast -->
+<div id="save-toast">✦ Saved</div>
+
+<!-- HUD -->
+<div id="hud">
+
+  <!-- Mode badge -->
+  <div id="mode-badge" class="glass" data-gesture="UNKNOWN">
+    <div id="mode-dot"></div>
+    <div id="mode-text">Waiting…</div>
+  </div>
+
+  <!-- Color panel -->
+  <div id="color-panel">
+    <div id="color-chip" class="glass">
+      <div id="color-swatch"></div>
+      <div id="color-name">CYAN</div>
+    </div>
+    <div id="swatch-row" class="glass">
+      <!-- Filled by JS -->
+    </div>
+  </div>
+
+  <!-- Fist / clear progress -->
+  <div id="fist-bar-wrap">
+    <div class="fist-label-row">
+      <span class="fist-label">Hold to clear</span>
+      <span id="fist-pct">0%</span>
+    </div>
+    <div class="fist-track"><div id="fist-bar"></div></div>
+  </div>
+
+  <!-- No-hand prompt -->
+  <div id="no-hand" class="visible">
+    <div class="nh-icon">✋</div>
+    <div class="nh-label">Show your hand</div>
+  </div>
+
+  <!-- Confidence meter -->
+  <div id="conf-panel" class="glass">
+    <span class="conf-label">Track</span>
+    <div id="conf-bars">
+      <div class="cbar"></div>
+      <div class="cbar"></div>
+      <div class="cbar"></div>
+      <div class="cbar"></div>
+      <div class="cbar"></div>
+    </div>
+  </div>
+
+  <!-- Stroke count -->
+  <div id="stroke-panel" class="glass">
+    <div id="stroke-count">0</div>
+    <div class="stroke-lbl">Strokes</div>
+  </div>
+
+  <!-- Gesture reference -->
+  <div id="help" class="glass">
+    <div class="h-item">
+      <span class="h-icon">☝️</span>
+      <div class="h-desc"><strong>Draw</strong>Index only</div>
+    </div>
+    <div class="h-item">
+      <span class="h-icon">🤏</span>
+      <div class="h-desc"><strong>Grab</strong>Pinch</div>
+    </div>
+    <div class="h-item">
+      <span class="h-icon">✌️</span>
+      <div class="h-desc"><strong>Color</strong>Peace</div>
+    </div>
+    <div class="h-item">
+      <span class="h-icon">✋</span>
+      <div class="h-desc"><strong>Pause</strong>Open</div>
+    </div>
+    <div class="h-item">
+      <span class="h-icon">✊</span>
+      <div class="h-desc"><strong>Clear</strong>Fist hold</div>
+    </div>
+  </div>
+
+</div><!-- /#hud -->
+
+<!-- Keyboard shortcuts hint -->
+<div id="kbd-hint">
+  <kbd>S</kbd> Save &nbsp;&nbsp; <kbd>C</kbd> Clear &nbsp;&nbsp; <kbd>N</kbd> Next color
+</div>
+
+<!-- Loading screen -->
+<div id="loading">
+  <div class="ld-logo">HANDART</div>
+  <div class="ld-tagline">Draw in thin air</div>
+  <div class="ld-bar-wrap"><div id="loading-bar"></div></div>
+  <div id="loading-label">Initializing…</div>
+</div>
+
+<!-- ── Inline app (single-file deployment) ──────────────────── -->
+<script>
+'use strict';
+
+/* ══════════════════════════════════════════════════════════════
+   GESTURE RECOGNIZER
+══════════════════════════════════════════════════════════════ */
+const GESTURES = { DRAWING:'DRAWING', PINCH:'PINCH', OPEN:'OPEN',
+                   FIST:'FIST', PEACE:'PEACE', UNKNOWN:'UNKNOWN' };
+
+const TIPS_IDX = [4,8,12,16,20];
+const PIPS_IDX = [3,6,10,14,18];
+
+class GestureRecognizer {
+  constructor({ pinchThreshold=0.075, debounceFrames=4 }={}) {
+    this.pt = pinchThreshold;
+    this.df = debounceFrames;
+    this._buf = []; this._stable = GESTURES.UNKNOWN;
+  }
+  recognize(lm, hand) {
+    if (!lm?.length) return GESTURES.UNKNOWN;
+    const raw = this._raw(lm, hand);
+    this._buf.push(raw);
+    if (this._buf.length > this.df) this._buf.shift();
+    if (this._buf.every(g => g === raw)) this._stable = raw;
+    return this._stable;
+  }
+  pinchStrength(lm) { return Math.max(0, 1 - this._d2(lm[4],lm[8]) / this.pt); }
+  indexTip(lm)      { return { x:1-lm[8].x, y:lm[8].y, z:lm[8].z }; }
+  pinchMid(lm)      { return { x:1-(lm[4].x+lm[8].x)/2, y:(lm[4].y+lm[8].y)/2, z:(lm[4].z+lm[8].z)/2 }; }
+
+  _raw(lm, hand) {
+    if (this._d2(lm[4],lm[8]) < this.pt) return GESTURES.PINCH;
+    const ext = this._ext(lm, hand);
+    const cnt = ext.reduce((n,v)=>n+(v?1:0),0);
+    if (cnt === 0)                               return GESTURES.FIST;
+    if (cnt >= 4)                                return GESTURES.OPEN;
+    if (ext[1] && !ext[2] && !ext[3] && !ext[4]) return GESTURES.DRAWING;
+    if (ext[1] &&  ext[2] && !ext[3] && !ext[4]) return GESTURES.PEACE;
+    return GESTURES.UNKNOWN;
+  }
+  _ext(lm, hand) {
+    const r = hand === 'Right';
+    return [
+      r ? lm[4].x < lm[2].x : lm[4].x > lm[2].x,
+      lm[8].y  < lm[6].y,
+      lm[12].y < lm[10].y,
+      lm[16].y < lm[14].y,
+      lm[20].y < lm[18].y,
+    ];
+  }
+  _d2(a,b) { return Math.hypot(a.x-b.x, a.y-b.y); }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   DRAWING SYSTEM
+══════════════════════════════════════════════════════════════ */
+const GLOW = [
+  {wm:10, a:0.04, b:40},
+  {wm:5,  a:0.13, b:20},
+  {wm:2.5,a:0.42, b:8 },
+  {wm:1,  a:0.95, b:0 },
+];
+
+const COLORS = [
+  {id:'CYAN',    hex:'#00e5ff', shadow:'#0055ff', glow:'rgba(0,229,255,'},
+  {id:'MAGENTA', hex:'#ff00cc', shadow:'#aa00ff', glow:'rgba(255,0,204,'},
+  {id:'EMERALD', hex:'#00ff88', shadow:'#008844', glow:'rgba(0,255,136,'},
+  {id:'AMBER',   hex:'#ff9500', shadow:'#ff4400', glow:'rgba(255,149,0,'},
+  {id:'VOLT',    hex:'#ccff00', shadow:'#66aa00', glow:'rgba(204,255,0,'},
+  {id:'ROSE',    hex:'#ff0066', shadow:'#aa0033', glow:'rgba(255,0,102,'},
+  {id:'LAVENDER',hex:'#cc88ff', shadow:'#6600ff', glow:'rgba(204,136,255,'},
+  {id:'WHITE',   hex:'#d0eeff', shadow:'#4488bb', glow:'rgba(208,238,255,'},
+];
+
+class DrawingSystem {
+  constructor(pCv, aCv, ptCv) {
+    this.pCv=pCv; this.aCv=aCv; this.ptCv=ptCv;
+    this.pCtx=pCv.getContext('2d');
+    this.aCtx=aCv.getContext('2d');
+    this.ptCtx=ptCv.getContext('2d');
+    this.strokes=[]; this.activeStroke=null; this.lastPt=null;
+    this.grabbed=null; this.grabOrigin=null;
+    this.colorIndex=0; this.baseWidth=3;
+    this._particles=[];
+  }
+  get W(){ return this.pCv.width; }
+  get H(){ return this.pCv.height; }
+  get color(){ return COLORS[this.colorIndex]; }
+  nextColor(){ this.colorIndex=(this.colorIndex+1)%COLORS.length; }
+
+  beginStroke(x,y,z=0){
+    this.activeStroke={points:[{x,y,z}],color:this.color,width:this.baseWidth};
+    this.lastPt={x,y,z};
+  }
+  addPoint(x,y,z=0){
+    if(!this.activeStroke) return;
+    if(Math.hypot(x-this.lastPt.x,y-this.lastPt.y)<4) return;
+    this.activeStroke.points.push({x,y,z});
+    this.lastPt={x,y,z};
+    this._spawn(x,y,this.color);
+    this._renderActive();
+  }
+  endStroke(){
+    if(!this.activeStroke) return;
+    if(this.activeStroke.points.length>=2){
+      this._draw(this.pCtx, this.activeStroke);
+      this.strokes.push(this.activeStroke);
+    }
+    this.activeStroke=null;
+    this.aCtx.clearRect(0,0,this.W,this.H);
+  }
+  clearAll(){
+    this.strokes=[]; this.activeStroke=null;
+    this.grabbed=null; this._particles=[];
+    this.pCtx.clearRect(0,0,this.W,this.H);
+    this.aCtx.clearRect(0,0,this.W,this.H);
+    this.ptCtx.clearRect(0,0,this.W,this.H);
+  }
+
+  grabAt(x,y){
+    let cl=null, md=90;
+    for(const s of this.strokes)
+      for(const p of s.points){ const d=Math.hypot(x-p.x,y-p.y); if(d<md){md=d;cl=s;} }
+    if(cl){ this.grabbed=cl; this.grabOrigin={x,y}; }
+    return !!cl;
+  }
+  moveGrab(x,y){
+    if(!this.grabbed||!this.grabOrigin) return;
+    const dx=x-this.grabOrigin.x, dy=y-this.grabOrigin.y;
+    for(const p of this.grabbed.points){p.x+=dx;p.y+=dy;}
+    this.grabOrigin={x,y};
+    this._redraw();
+  }
+  releaseGrab(){ this.grabbed=null; this.grabOrigin=null; }
+
+  tickParticles(){
+    const ctx=this.ptCtx;
+    ctx.clearRect(0,0,this.W,this.H);
+    this._particles=this._particles.filter(p=>p.l>0);
+    for(const p of this._particles){
+      p.x+=p.vx; p.y+=p.vy; p.vy+=0.05; p.l-=0.028;
+      ctx.save();
+      ctx.globalAlpha=p.l;
+      ctx.beginPath();
+      ctx.arc(p.x,p.y,p.r*p.l,0,Math.PI*2);
+      ctx.fillStyle=p.c;
+      ctx.shadowBlur=8; ctx.shadowColor=p.c;
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+  _spawn(x,y,col){
+    if(this._particles.length>150) return;
+    const a=Math.random()*Math.PI*2, sp=0.6+Math.random()*1.8;
+    this._particles.push({
+      x,y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp-1.2,
+      r:1.5+Math.random()*2, l:0.7+Math.random()*0.3, c:col.hex,
+    });
+  }
+
+  _draw(ctx, stroke){
+    const pts=stroke.points;
+    if(pts.length<2) return;
+    const col=stroke.color, bw=stroke.width;
+    const db=1+(pts[0].z||0)*1.5;
+    ctx.save();
+    ctx.lineCap='round'; ctx.lineJoin='round';
+    for(const L of GLOW){
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x,pts[0].y);
+      for(let i=1;i<pts.length-1;i++){
+        const mx=(pts[i].x+pts[i+1].x)/2, my=(pts[i].y+pts[i+1].y)/2;
+        ctx.quadraticCurveTo(pts[i].x,pts[i].y,mx,my);
+      }
+      ctx.lineTo(pts[pts.length-1].x,pts[pts.length-1].y);
+      ctx.strokeStyle=col.hex;
+      ctx.globalAlpha=Math.min(1,L.a*db);
+      ctx.lineWidth=bw*L.wm*db;
+      ctx.shadowBlur=L.b; ctx.shadowColor=col.shadow;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  _redraw(){
+    this.pCtx.clearRect(0,0,this.W,this.H);
+    for(const s of this.strokes) this._draw(this.pCtx,s);
+  }
+  _renderActive(){
+    if(!this.activeStroke) return;
+    this.aCtx.clearRect(0,0,this.W,this.H);
+    this._draw(this.aCtx,this.activeStroke);
+  }
+
+  saveImage(vid=null){
+    const off=document.createElement('canvas');
+    off.width=this.W; off.height=this.H;
+    const ctx=off.getContext('2d');
+    ctx.fillStyle='#020c14'; ctx.fillRect(0,0,this.W,this.H);
+    if(vid){
+      ctx.save(); ctx.globalAlpha=0.22;
+      ctx.translate(this.W,0); ctx.scale(-1,1);
+      ctx.drawImage(vid,0,0,this.W,this.H);
+      ctx.restore();
+    }
+    ctx.drawImage(this.pCv,0,0);
+    ctx.drawImage(this.aCv,0,0);
+    const a=document.createElement('a');
+    a.download=`handart_${Date.now()}.png`;
+    a.href=off.toDataURL('image/png');
+    a.click();
+  }
+  onResize(ow,oh,nw,nh){
+    const sx=nw/ow, sy=nh/oh;
+    const sc=p=>{p.x*=sx;p.y*=sy;};
+    for(const s of this.strokes) s.points.forEach(sc);
+    this.activeStroke?.points.forEach(sc);
+    this._redraw();
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   HAND RENDERER
+══════════════════════════════════════════════════════════════ */
+const BONES=[
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],
+];
+const TIP_SET=new Set([4,8,12,16,20]);
+
+class HandRenderer {
+  constructor(cv){ this.cv=cv; this.ctx=cv.getContext('2d'); }
+  get W(){ return this.cv.width; }
+  get H(){ return this.cv.height; }
+
+  render(lm, gesture, ps, color, conf=1){
+    this.ctx.clearRect(0,0,this.W,this.H);
+    if(!lm) return;
+    const pts=lm.map(l=>({x:(1-l.x)*this.W, y:l.y*this.H, z:l.z}));
+    const a=0.3+conf*0.7;
+    const isDraw  = gesture===GESTURES.DRAWING;
+    const isPinch = gesture===GESTURES.PINCH;
+    const isFist  = gesture===GESTURES.FIST;
+    const isPeace = gesture===GESTURES.PEACE;
+
+    // bones
+    const ctx=this.ctx;
+    ctx.save(); ctx.lineCap='round';
+    for(const [ai,bi] of BONES){
+      for(const pass of [{w:4,blur:10,op:0.15},{w:1.5,blur:0,op:0.65}]){
+        ctx.beginPath(); ctx.moveTo(pts[ai].x,pts[ai].y); ctx.lineTo(pts[bi].x,pts[bi].y);
+        ctx.strokeStyle=isDraw?color.hex:'rgba(0,200,240,0.9)';
+        ctx.globalAlpha=a*pass.op; ctx.lineWidth=pass.w;
+        ctx.shadowBlur=pass.blur; ctx.shadowColor=isDraw?color.hex:'#0099cc';
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+
+    // joints
+    for(let i=0;i<pts.length;i++){
+      const pt=pts[i], isTip=TIP_SET.has(i), isIdx=(i===8);
+      ctx.save(); ctx.globalAlpha=a;
+      const r=isIdx&&isDraw?7:isTip?4.5:2.5;
+      ctx.beginPath(); ctx.arc(pt.x,pt.y,r,0,Math.PI*2);
+      if(isIdx&&isDraw){ ctx.fillStyle=color.hex; ctx.shadowBlur=24; ctx.shadowColor=color.hex; }
+      else { ctx.fillStyle=isTip?'rgba(0,230,255,0.95)':'rgba(0,180,220,0.6)'; ctx.shadowBlur=isTip?10:4; ctx.shadowColor='#00aaee'; }
+      ctx.fill();
+      // pulse ring on index when drawing
+      if(isIdx&&isDraw){
+        const t=performance.now()/600;
+        const pr=r+8+Math.sin(t)*4;
+        ctx.beginPath(); ctx.arc(pt.x,pt.y,pr,0,Math.PI*2);
+        ctx.strokeStyle=color.glow+'0.25)'; ctx.lineWidth=1.5;
+        ctx.shadowBlur=16; ctx.shadowColor=color.hex; ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // pinch bridge
+    if(isPinch){
+      const t4=pts[4],t8=pts[8];
+      const mx=(t4.x+t8.x)/2, my=(t4.y+t8.y)/2;
+      ctx.save(); ctx.globalAlpha=a*ps;
+      ctx.beginPath(); ctx.moveTo(t4.x,t4.y); ctx.lineTo(t8.x,t8.y);
+      ctx.strokeStyle='#ff9500'; ctx.lineWidth=2; ctx.shadowBlur=18; ctx.shadowColor='#ff6600'; ctx.stroke();
+      ctx.beginPath(); ctx.arc(mx,my,8+ps*10,0,Math.PI*2);
+      ctx.strokeStyle=`rgba(255,149,0,${ps})`; ctx.lineWidth=2; ctx.shadowBlur=26; ctx.stroke();
+      ctx.restore();
+    }
+    // fist ring
+    if(isFist){
+      const t=performance.now()/400;
+      ctx.save(); ctx.globalAlpha=a*0.75;
+      ctx.beginPath(); ctx.arc(pts[0].x,pts[0].y,42+Math.sin(t)*6,0,Math.PI*2);
+      ctx.strokeStyle='#ff3333'; ctx.lineWidth=2; ctx.shadowBlur=22; ctx.shadowColor='#ff0000'; ctx.stroke();
+      ctx.restore();
+    }
+    // peace glow
+    if(isPeace){
+      for(const tip of [pts[8],pts[12]]){
+        ctx.save(); ctx.globalAlpha=a*0.8;
+        ctx.beginPath(); ctx.arc(tip.x,tip.y,13,0,Math.PI*2);
+        ctx.strokeStyle='#ccff00'; ctx.lineWidth=2; ctx.shadowBlur=20; ctx.shadowColor='#aaff00'; ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SMOOTHED POINT
+══════════════════════════════════════════════════════════════ */
+class SmoothedPoint {
+  constructor(f=0.55){ this.f=f; this.x=this.y=this.z=0; this._i=false; }
+  update(x,y,z=0){
+    if(!this._i){ this.x=x;this.y=y;this.z=z;this._i=true; return; }
+    const k=1-this.f;
+    this.x+=(x-this.x)*k; this.y+=(y-this.y)*k; this.z+=(z-this.z)*k;
+  }
+  reset(){ this._i=false; }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   UI MANAGER
+══════════════════════════════════════════════════════════════ */
+const G_LABELS={DRAWING:'☝  Drawing',PINCH:'🤏  Grab',OPEN:'✋  Paused',
+                FIST:'✊  Clearing',PEACE:'✌  Color',UNKNOWN:'· · ·'};
+
+class UIManager {
+  constructor(){
+    this.badge     = document.getElementById('mode-badge');
+    this.modeText  = document.getElementById('mode-text');
+    this.swatch    = document.getElementById('color-swatch');
+    this.cname     = document.getElementById('color-name');
+    this.fistWrap  = document.getElementById('fist-bar-wrap');
+    this.fistBar   = document.getElementById('fist-bar');
+    this.fistPct   = document.getElementById('fist-pct');
+    this.noHand    = document.getElementById('no-hand');
+    this.confBars  = document.getElementById('conf-bars');
+    this.sc        = document.getElementById('stroke-count');
+    this.flash     = document.getElementById('clear-flash');
+    this.toast     = document.getElementById('save-toast');
+    this.swatches  = document.getElementById('swatch-row');
+    this.accent    = document.getElementById('color-accent');
+    this._toastT   = null;
+    setTimeout(()=>document.getElementById('help')?.classList.add('faded'), 10000);
+  }
+
+  update({gesture='UNKNOWN',color,fistFrames=0,fistMax=28,confidence=0,strokeCount=0,handPresent=false}){
+    this.badge?.setAttribute('data-gesture', gesture);
+    if(this.modeText) this.modeText.textContent = G_LABELS[gesture]??'· · ·';
+
+    if(color){
+      if(this.swatch){ this.swatch.style.background=color.hex; this.swatch.style.boxShadow=`0 0 10px ${color.hex},0 0 28px ${color.shadow}`; }
+      if(this.cname) { this.cname.textContent=color.id; this.cname.style.color=color.hex; }
+      if(this.accent){ this.accent.style.background=color.hex; this.accent.style.boxShadow=`0 0 14px ${color.hex},0 0 35px ${color.shadow}`; }
+    }
+
+    const pct=Math.min(fistFrames/fistMax,1);
+    if(gesture==='FIST'){
+      this.fistWrap?.classList.add('visible');
+      if(this.fistBar) this.fistBar.style.width=(pct*100)+'%';
+      if(this.fistPct) this.fistPct.textContent=Math.round(pct*100)+'%';
+    } else {
+      this.fistWrap?.classList.remove('visible');
+      if(this.fistBar) this.fistBar.style.width='0%';
+    }
+
+    handPresent?this.noHand?.classList.remove('visible'):this.noHand?.classList.add('visible');
+
+    if(this.confBars){
+      const active=Math.round(confidence*5);
+      Array.from(this.confBars.children).forEach((b,i)=>b.classList.toggle('active',i<active));
+    }
+    if(this.sc) this.sc.textContent=strokeCount;
+  }
+
+  highlightSwatch(idx){
+    Array.from(this.swatches?.children??[]).forEach((el,i)=>el.classList.toggle('active',i===idx));
+  }
+
+  flashClear(){
+    this.flash?.classList.add('active');
+    setTimeout(()=>this.flash?.classList.remove('active'),220);
+  }
+  showSave(){
+    clearTimeout(this._toastT);
+    this.toast?.classList.add('visible');
+    this._toastT=setTimeout(()=>this.toast?.classList.remove('visible'),2200);
+  }
+  setLoading(lbl,pct){
+    const l=document.getElementById('loading-label');
+    const b=document.getElementById('loading-bar');
+    if(l) l.textContent=lbl;
+    if(b) b.style.width=pct+'%';
+  }
+  hideLoading(){
+    const el=document.getElementById('loading');
+    if(!el) return;
+    el.classList.add('hidden');
+    setTimeout(()=>el.remove(),900);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   MAIN APP
+══════════════════════════════════════════════════════════════ */
+const CONFIG2={
+  MIN_DET:0.75, MIN_TRK:0.75,
+  FIST_MAX:28, PEACE_MAX:14,
+};
+
+class HandArtApp {
+  constructor(){
+    this.video  = document.getElementById('video');
+    this.pCv    = document.getElementById('persistCanvas');
+    this.aCv    = document.getElementById('activeCanvas');
+    this.ptCv   = document.getElementById('particleCanvas');
+    this.hCv    = document.getElementById('handCanvas');
+
+    this.gr   = new GestureRecognizer();
+    this.ds   = new DrawingSystem(this.pCv, this.aCv, this.ptCv);
+    this.hr   = new HandRenderer(this.hCv);
+    this.ui   = new UIManager();
+
+    this.prevGesture = GESTURES.UNKNOWN;
+    this.isDrawing   = false;
+    this.fistF       = 0;
+    this.peaceF      = 0;
+    this.handPresent = false;
+    this.conf        = 0;
+
+    this.fingerPos = new SmoothedPoint(0.55);
+    this.pinchPos  = new SmoothedPoint(0.55);
+  }
+
+  async init(){
+    this.ui.setLoading('Sizing canvases…', 10);
+    this._size();
+    window.addEventListener('resize', ()=>this._onResize());
+    this._buildSwatches();
+    this.ui.setLoading('Loading hand model…', 35);
+
+    const hands = new Hands({ locateFile: f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+    hands.setOptions({ maxNumHands:1, modelComplexity:1,
+      minDetectionConfidence:CONFIG2.MIN_DET, minTrackingConfidence:CONFIG2.MIN_TRK });
+    hands.onResults(r=>this._results(r));
+
+    this.ui.setLoading('Starting camera…', 65);
+
+    try {
+      const cam = new Camera(this.video, {
+        onFrame: async()=>{ await hands.send({image:this.video}); },
+        width:1280, height:720,
+      });
+      await cam.start();
+    } catch(e){
+      this.ui.setLoading('⚠ Camera denied — allow access & reload', 100);
+      return;
+    }
+
+    this.ui.setLoading('Ready ✦', 100);
+    setTimeout(()=>this.ui.hideLoading(), 500);
+
+    requestAnimationFrame(()=>this._ptLoop());
+
+    window.addEventListener('keydown', e=>{
+      switch(e.key.toLowerCase()){
+        case 's': this._save();  break;
+        case 'c': this._clear(); break;
+        case 'n': this.ds.nextColor(); this.ui.highlightSwatch(this.ds.colorIndex); break;
+      }
+    });
+  }
+
+  _results(res){
+    const W=this.hCv.width, H=this.hCv.height;
+
+    if(!res.multiHandLandmarks?.length){
+      this.handPresent=false; this.conf=0;
+      this.fingerPos.reset(); this.pinchPos.reset();
+      this.hr.render(null,GESTURES.UNKNOWN,0,this.ds.color,0);
+      if(this.isDrawing){this.ds.endStroke();this.isDrawing=false;}
+      this.ds.releaseGrab();
+      this._sync(GESTURES.UNKNOWN);
+      return;
+    }
+
+    this.handPresent=true;
+    const lm   = res.multiHandLandmarks[0];
+    const hand = res.multiHandedness[0].label;
+    const conf = res.multiHandedness[0].score;
+    this.conf  = conf;
+
+    if(conf<0.5){ this.hr.render(lm,GESTURES.UNKNOWN,0,this.ds.color,conf); return; }
+
+    const g  = this.gr.recognize(lm, hand);
+    const ps = this.gr.pinchStrength(lm);
+
+    const tip = this.gr.indexTip(lm);
+    const mid = this.gr.pinchMid(lm);
+    this.fingerPos.update(tip.x, tip.y, tip.z);
+    this.pinchPos.update(mid.x, mid.y, mid.z);
+
+    const fx=this.fingerPos.x*W, fy=this.fingerPos.y*H, fz=this.fingerPos.z;
+    const px=this.pinchPos.x*W,  py=this.pinchPos.y*H;
+
+    switch(g){
+      case GESTURES.DRAWING:
+        this.ds.releaseGrab();
+        this.fistF=0; this.peaceF=0;
+        if(!this.isDrawing){ this.ds.beginStroke(fx,fy,fz); this.isDrawing=true; }
+        else this.ds.addPoint(fx,fy,fz);
+        break;
+
+      case GESTURES.PINCH:
+        if(this.isDrawing){this.ds.endStroke();this.isDrawing=false;}
+        this.fistF=0; this.peaceF=0;
+        if(this.prevGesture!==GESTURES.PINCH) this.ds.grabAt(px,py);
+        else this.ds.moveGrab(px,py);
+        break;
+
+      case GESTURES.PEACE:
+        if(this.isDrawing){this.ds.endStroke();this.isDrawing=false;}
+        this.ds.releaseGrab(); this.fistF=0;
+        this.peaceF++;
+        if(this.peaceF>=CONFIG2.PEACE_MAX){ this.ds.nextColor(); this.peaceF=0; }
+        break;
+
+      case GESTURES.FIST:
+        if(this.isDrawing){this.ds.endStroke();this.isDrawing=false;}
+        this.ds.releaseGrab(); this.peaceF=0;
+        this.fistF++;
+        if(this.fistF>=CONFIG2.FIST_MAX){ this._clear(); this.fistF=0; }
+        break;
+
+      default:
+        if(this.isDrawing){this.ds.endStroke();this.isDrawing=false;}
+        this.ds.releaseGrab(); this.fistF=0; this.peaceF=0;
+        break;
+    }
+
+    this.hr.render(lm, g, ps, this.ds.color, conf);
+    this._sync(g);
+    this.prevGesture=g;
+  }
+
+  _sync(g){
+    this.ui.update({gesture:g, color:this.ds.color, fistFrames:this.fistF,
+      fistMax:CONFIG2.FIST_MAX, confidence:this.conf,
+      strokeCount:this.ds.strokes.length, handPresent:this.handPresent});
+    this.ui.highlightSwatch(this.ds.colorIndex);
+  }
+
+  _clear(){ this.ds.clearAll(); this.ui.flashClear(); }
+  _save() { this.ds.saveImage(this.video); this.ui.showSave(); }
+
+  _buildSwatches(){
+    const row=document.getElementById('swatch-row');
+    if(!row) return;
+    COLORS.forEach((col,i)=>{
+      const el=document.createElement('div');
+      el.className='swatch'; el.title=col.id;
+      el.style.background=col.hex;
+      el.style.setProperty('--c', col.hex);
+      row.style.pointerEvents='all';
+      el.addEventListener('click',()=>{ this.ds.colorIndex=i; this.ui.highlightSwatch(i); });
+      row.appendChild(el);
+    });
+  }
+
+  _size(){
+    const w=window.innerWidth, h=window.innerHeight;
+    for(const cv of [this.pCv,this.aCv,this.ptCv,this.hCv]){cv.width=w;cv.height=h;}
+  }
+  _onResize(){
+    const ow=this.pCv.width, oh=this.pCv.height;
+    this._size();
+    this.ds.onResize(ow,oh,window.innerWidth,window.innerHeight);
+  }
+  _ptLoop(){ this.ds.tickParticles(); requestAnimationFrame(()=>this._ptLoop()); }
+}
+
+window.addEventListener('load', ()=>{
+  const app = new HandArtApp();
+  app.init().catch(e=>console.error('[HandArt]',e));
+  window._handart = app;
+});
+</script>
+</body>
+</html>
